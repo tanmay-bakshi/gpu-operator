@@ -64,6 +64,7 @@ const (
 	ocpNamespaceMonitoringLabelValue    = "true"
 	precompiledIdentificationLabelKey   = "nvidia.com/precompiled"
 	precompiledIdentificationLabelValue = "true"
+	osVersionLabelKey                   = "nvidia.com/os-version"
 	// see bundle/manifests/gpu-operator.clusterserviceversion.yaml
 	//     --> ClusterServiceVersion.metadata.annotations.operatorframework.io/suggested-namespace
 	ocpSuggestedNamespace          = "nvidia-gpu-operator"
@@ -139,6 +140,11 @@ type OpenShiftDriverToolkit struct {
 	rhcosDriverToolkitImages map[string]string
 }
 
+type osInfo struct {
+	osID      string
+	osVersion string
+}
+
 // ClusterPolicyController represents clusterpolicy controller spec for GPU operator
 type ClusterPolicyController struct {
 	client client.Client
@@ -156,6 +162,8 @@ type ClusterPolicyController struct {
 	idx                  int
 	kernelVersionMap     map[string]string
 	currentKernelVersion string
+	osVersionMap         map[string]osInfo
+	currentOSVersion     string
 
 	k8sVersion       string
 	openshift        string
@@ -890,6 +898,15 @@ func (n *ClusterPolicyController) init(ctx context.Context, reconciler *ClusterP
 		if err != nil {
 			return err
 		}
+	}
+
+	if n.singleton.Spec.Driver.IsEnabled() && !n.singleton.Spec.Driver.UsePrecompiledDrivers() && !(n.openshift != "" && n.ocpDriverToolkit.enabled) {
+		osVersionMap, err := n.getOSVersionsMap()
+		if err != nil {
+			n.logger.Info("Unable to obtain all OS versions of the GPU nodes in the cluster", "err", err)
+			return err
+		}
+		n.osVersionMap = osVersionMap
 	}
 	return nil
 }

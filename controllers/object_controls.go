@@ -653,6 +653,46 @@ func (n ClusterPolicyController) getKernelVersionsMap() (map[string]string, erro
 	return kernelVersionMap, nil
 }
 
+// getOSVersionsMap returns a map of OS identifiers to their release/version
+// found across all GPU nodes in the cluster.
+func (n ClusterPolicyController) getOSVersionsMap() (map[string]osInfo, error) {
+	osMap := make(map[string]osInfo)
+	ctx := n.ctx
+	logger := n.logger.WithValues("Request.Namespace", "default", "Request.Name", "Node")
+
+	opts := []client.ListOption{
+		client.MatchingLabels{"nvidia.com/gpu.present": "true"},
+	}
+
+	list := &corev1.NodeList{}
+	err := n.client.List(ctx, list, opts...)
+	if err != nil {
+		logger.Info("Could not get NodeList", "ERROR", err)
+		return nil, err
+	}
+
+	if len(list.Items) == 0 {
+		logger.Info("Could not get any nodes to match nvidia.com/gpu.present label")
+		return nil, nil
+	}
+
+	for _, node := range list.Items {
+		labels := node.GetLabels()
+		osID, ok1 := labels[nfdOSReleaseIDLabelKey]
+		osVersion, ok2 := labels[nfdOSVersionIDLabelKey]
+		if !ok1 || !ok2 {
+			logger.Info("WARNING: Could not find NFD labels for node. Is NFD installed?", "Node", node.Name)
+			continue
+		}
+		key := fmt.Sprintf("%s%s", osID, osVersion)
+		if _, exists := osMap[key]; !exists {
+			osMap[key] = osInfo{osID: osID, osVersion: osVersion}
+		}
+	}
+
+	return osMap, nil
+}
+
 func kernelFullVersion(n ClusterPolicyController) (string, string, string) {
 	ctx := n.ctx
 	logger := n.logger.WithValues("Request.Namespace", "default", "Request.Name", "Node")
@@ -675,32 +715,28 @@ func kernelFullVersion(n ClusterPolicyController) (string, string, string) {
 		return "", "", ""
 	}
 
-	// Assuming all nodes are running the same kernel version,
-	// One could easily add driver-kernel-versions for each node.
-	node := list.Items[0]
-	labels := node.GetLabels()
+	for _, node := range list.Items {
+		labels := node.GetLabels()
 
-	var ok bool
-	kFVersion, ok := labels[nfdKernelLabelKey]
-	if ok {
-		logger.Info(kFVersion)
-	} else {
-		err := apierrors.NewNotFound(schema.GroupResource{Group: "Node", Resource: "Label"}, nfdKernelLabelKey)
-		logger.Info("Couldn't get kernelVersion, did you run the node feature discovery?", "Error", err)
-		return "", "", ""
+		osName := labels[nfdOSReleaseIDLabelKey]
+		osVersion := labels[nfdOSVersionIDLabelKey]
+		osTag := fmt.Sprintf("%s%s", osName, osVersion)
+
+		if n.currentOSVersion != "" && osTag != n.currentOSVersion {
+			continue
+		}
+
+		kFVersion, ok := labels[nfdKernelLabelKey]
+		if !ok {
+			err := apierrors.NewNotFound(schema.GroupResource{Group: "Node", Resource: "Label"}, nfdKernelLabelKey)
+			logger.Info("Couldn't get kernelVersion, did you run the node feature discovery?", "Error", err)
+			return "", "", ""
+		}
+
+		return kFVersion, osTag, osVersion
 	}
 
-	osName, ok := labels[nfdOSReleaseIDLabelKey]
-	if !ok {
-		return kFVersion, "", ""
-	}
-	osVersion, ok := labels[nfdOSVersionIDLabelKey]
-	if !ok {
-		return kFVersion, "", ""
-	}
-	osTag := fmt.Sprintf("%s%s", osName, osVersion)
-
-	return kFVersion, osTag, osVersion
+	return "", "", ""
 }
 
 func preprocessService(obj *corev1.Service, n ClusterPolicyController) error {
@@ -1051,6 +1087,8 @@ func TransformDriver(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n C
 		if err != nil {
 			return fmt.Errorf("ERROR: failed to transform the pre-compiled Driver Daemonset: %s", err)
 		}
+	} else if n.currentOSVersion != "" {
+		transformOSDriverDaemonset(obj, n)
 	}
 	return nil
 }
@@ -2879,6 +2917,21 @@ func transformPrecompiledDriverDaemonset(obj *appsv1.DaemonSet, config *gpuv1.Cl
 	return nil
 }
 
+func transformOSDriverDaemonset(obj *appsv1.DaemonSet, n ClusterPolicyController) {
+	osInfo := n.osVersionMap[n.currentOSVersion]
+	obj.ObjectMeta.Name += "-" + n.currentOSVersion
+	obj.Spec.Template.Spec.NodeSelector[nfdOSReleaseIDLabelKey] = osInfo.osID
+	obj.Spec.Template.Spec.NodeSelector[nfdOSVersionIDLabelKey] = osInfo.osVersion
+	if obj.ObjectMeta.Labels == nil {
+		obj.ObjectMeta.Labels = make(map[string]string)
+	}
+	obj.ObjectMeta.Labels[osVersionLabelKey] = n.currentOSVersion
+	if obj.Spec.Template.ObjectMeta.Labels == nil {
+		obj.Spec.Template.ObjectMeta.Labels = make(map[string]string)
+	}
+	obj.Spec.Template.ObjectMeta.Labels[osVersionLabelKey] = n.currentOSVersion
+}
+
 func transformOpenShiftDriverToolkitContainer(obj *appsv1.DaemonSet, config *gpuv1.ClusterPolicySpec, n ClusterPolicyController, mainContainerName string) error {
 	var err error
 
@@ -3878,6 +3931,39 @@ func (n ClusterPolicyController) cleanupStalePrecompiledDaemonsets(ctx context.C
 	return nil
 }
 
+// cleanupStaleOSDaemonsets deletes stale OS specific driver daemonsets when
+// no nodes for a given OS version are present.
+func (n ClusterPolicyController) cleanupStaleOSDaemonsets(ctx context.Context) error {
+	opts := []client.ListOption{
+		client.MatchingLabels{appLabelKey: commonDriverDaemonsetName},
+	}
+
+	list := &appsv1.DaemonSetList{}
+	err := n.client.List(ctx, list, opts...)
+	if err != nil {
+		n.logger.Error(err, "could not get daemonset list")
+		return err
+	}
+
+	for idx := range list.Items {
+		ds := list.Items[idx]
+		osTag, ok := ds.ObjectMeta.Labels[osVersionLabelKey]
+		if !ok {
+			continue
+		}
+		desired := ds.Status.DesiredNumberScheduled
+		if desired == 0 {
+			if _, exists := n.osVersionMap[osTag]; !exists {
+				n.logger.Info("Delete Driver DaemonSet", "Name", ds.Name)
+				if err := n.client.Delete(ctx, &ds); err != nil {
+					n.logger.Error(err, "Could not delete DaemonSet", "Name", ds.Name)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // precompiledDriverDaemonsets goes through all the kernel versions
 // found in the cluster, sets `currentKernelVersion` and calls the
 // original DaemonSet() function to create/update the kernel-specific
@@ -3912,6 +3998,32 @@ func precompiledDriverDaemonsets(ctx context.Context, n ClusterPolicyController)
 
 	// reset current kernel version
 	n.currentKernelVersion = ""
+	return overallState, errs
+}
+
+// osDriverDaemonSets loops over all detected OS versions and deploys a driver
+// DaemonSet for each of them.
+func osDriverDaemonSets(ctx context.Context, n ClusterPolicyController) (gpuv1.State, []error) {
+	overallState := gpuv1.Ready
+	var errs []error
+
+	err := n.cleanupStaleOSDaemonsets(ctx)
+	if err != nil {
+		return gpuv1.NotReady, append(errs, err)
+	}
+
+	for osTag := range n.osVersionMap {
+		n.currentOSVersion = osTag
+		state, err := DaemonSet(n)
+		if state != gpuv1.Ready {
+			overallState = state
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to handle OS specific Driver Daemonset for %s: %v", osTag, err))
+		}
+	}
+
+	n.currentOSVersion = ""
 	return overallState, errs
 }
 
@@ -4259,7 +4371,6 @@ func DaemonSet(n ClusterPolicyController) (gpuv1.State, error) {
 			if n.currentKernelVersion == "" {
 				overallState, errs := precompiledDriverDaemonsets(ctx, n)
 				if len(errs) != 0 {
-					// log errors
 					return overallState, fmt.Errorf("Unable to deploy precompiled driver daemonsets %v", errs)
 				}
 				return overallState, nil
@@ -4267,6 +4378,12 @@ func DaemonSet(n ClusterPolicyController) (gpuv1.State, error) {
 		} else if n.openshift != "" && n.ocpDriverToolkit.enabled &&
 			n.ocpDriverToolkit.currentRhcosVersion == "" {
 			return n.ocpDriverToolkitDaemonSets(ctx)
+		} else if n.currentOSVersion == "" && len(n.osVersionMap) > 1 {
+			overallState, errs := osDriverDaemonSets(ctx, n)
+			if len(errs) != 0 {
+				return overallState, fmt.Errorf("Unable to deploy OS specific driver daemonsets %v", errs)
+			}
+			return overallState, nil
 		}
 	} else if n.resources[state].DaemonSet.ObjectMeta.Name == commonVGPUManagerDaemonsetName {
 		podCount, err := n.cleanupUnusedVGPUManagerDaemonsets(ctx)
